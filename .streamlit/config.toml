@@ -1,0 +1,11 @@
+[server]
+# Tolerate slow/unstable network (important for mainland China users)
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# Clean theme for better mobile readability
+base = "light"
+primaryColor = "#1E40AF"
