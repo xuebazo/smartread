@@ -1,11 +1,25 @@
 """
 阅读历史数据仓储 — reading_history 表的 CRUD 封装
+同时管理分析结果缓存（避免重复调用 API）和阅读状态恢复
 """
+import hashlib
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 
 DB_PATH = Path(__file__).parent.parent / "cache.db"
+
+
+def make_article_key(link: str = "", text: str = "") -> str:
+    """
+    生成文章缓存键
+    - 有 link（RSS 文章）→ 用 link 的 MD5
+    - 无 link（手动输入）→ 用文本前 2000 字符 + 总长度的 MD5
+    """
+    if link:
+        return hashlib.md5(link.encode()).hexdigest()
+    sample = text[:2000] + str(len(text))
+    return hashlib.md5(sample.encode()).hexdigest()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -37,6 +51,14 @@ def _get_conn() -> sqlite3.Connection:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_cache (
+            article_key TEXT PRIMARY KEY,
+            article_text TEXT DEFAULT '',
+            analysis_results TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     # 确保 reading_state 只有一行
     conn.execute("INSERT OR IGNORE INTO reading_state (id) VALUES (1)")
     conn.commit()
@@ -54,15 +76,26 @@ def save_reading_history(
     difficulty_stars: str = "",
     reading_minutes: int = 0,
 ) -> int:
-    """保存阅读记录，返回记录 ID"""
+    """保存阅读记录（同 link 只保留最新一条），返回记录 ID"""
     conn = _get_conn()
+    favorite = 0
+    if link:
+        # 保留旧记录的收藏状态
+        existing = conn.execute(
+            "SELECT favorite FROM reading_history WHERE link = ? AND link != ''",
+            (link,),
+        ).fetchone()
+        if existing:
+            favorite = existing["favorite"]
+        # 删除同 link 的旧记录，确保一篇文章只有一条阅读记录
+        conn.execute("DELETE FROM reading_history WHERE link = ? AND link != ''", (link,))
     cursor = conn.execute(
         """INSERT INTO reading_history
            (title, source, link, article_text, word_count,
-            difficulty, difficulty_score, difficulty_stars, reading_minutes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            difficulty, difficulty_score, difficulty_stars, reading_minutes, favorite)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (title, source, link, article_text, word_count,
-         difficulty, difficulty_score, difficulty_stars, reading_minutes),
+         difficulty, difficulty_score, difficulty_stars, reading_minutes, favorite),
     )
     conn.commit()
     row_id = cursor.lastrowid
@@ -211,3 +244,81 @@ def clear_reading_state() -> None:
     conn.execute("INSERT OR IGNORE INTO reading_state (id) VALUES (1)")
     conn.commit()
     conn.close()
+
+
+# ─── 分析结果缓存 ─────────────────────────────────────────
+
+def get_cached_analysis(article_key: str) -> dict | None:
+    """
+    根据 article_key 查找缓存的分析结果
+    命中返回 {"article_text": str, "analysis_results": dict}
+    未命中返回 None
+    """
+    import json
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT article_text, analysis_results FROM analysis_cache WHERE article_key = ?",
+        (article_key,),
+    ).fetchone()
+    conn.close()
+    if row and row["analysis_results"]:
+        return {
+            "article_text": row["article_text"] or "",
+            "analysis_results": json.loads(row["analysis_results"]),
+        }
+    return None
+
+
+def save_analysis_cache(article_key: str, article_text: str, analysis_results: str) -> None:
+    """保存分析结果到缓存（INSERT OR REPLACE）"""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO analysis_cache
+           (article_key, article_text, analysis_results, created_at)
+           VALUES (?, ?, ?, CURRENT_TIMESTAMP)""",
+        (article_key, article_text, analysis_results),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_reviewable_articles() -> list[dict]:
+    """
+    获取所有有缓存分析结果的已读文章，用于「文章复习」页面
+    返回 [{"id", "title", "source", "link", "difficulty", "difficulty_stars",
+           "read_at", "favorite", "word_count", "analysis_results": dict}, ...]
+    """
+    import json
+    conn = _get_conn()
+
+    rows = conn.execute(
+        "SELECT * FROM reading_history WHERE link != '' ORDER BY read_at DESC LIMIT 200"
+    ).fetchall()
+
+    result = []
+    for row in rows:
+        article_key = make_article_key(link=row["link"])
+        cached = conn.execute(
+            "SELECT analysis_results FROM analysis_cache WHERE article_key = ?",
+            (article_key,),
+        ).fetchone()
+        if cached and cached["analysis_results"]:
+            try:
+                analysis = json.loads(cached["analysis_results"])
+            except json.JSONDecodeError:
+                continue
+            result.append({
+                "id": row["id"],
+                "title": row["title"] or "",
+                "source": row["source"] or "",
+                "link": row["link"] or "",
+                "difficulty": row["difficulty"] or "",
+                "difficulty_stars": row["difficulty_stars"] or "",
+                "read_at": row["read_at"] or "",
+                "favorite": row["favorite"],
+                "word_count": row["word_count"] or 0,
+                "analysis_results": analysis,
+            })
+
+    conn.close()
+    return result

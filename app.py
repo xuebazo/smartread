@@ -53,6 +53,10 @@ from database.history_repository import (
     save_reading_state,
     load_reading_state,
     clear_reading_state,
+    make_article_key,
+    get_cached_analysis,
+    save_analysis_cache,
+    get_reviewable_articles,
 )
 
 # ─── 页面配置 ────────────────────────────────────────────
@@ -147,6 +151,8 @@ if "extraction_failed" not in st.session_state:
     st.session_state.extraction_failed = False
 if "failed_article_link" not in st.session_state:
     st.session_state.failed_article_link = ""
+if "review_article_link" not in st.session_state:
+    st.session_state.review_article_link = ""
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = {}
 if "read_start_time" not in st.session_state:
@@ -234,6 +240,26 @@ def _load_article_into_state(article: dict, full_text: str) -> None:
     ).strip(" ·")
     st.session_state.page = "📖 阅读工具"
     st.session_state.analysis_done = False
+    st.session_state.extraction_failed = False
+    st.session_state.failed_article_link = ""
+
+
+def _load_article_for_review(article: dict) -> None:
+    """已读且有缓存的文章直接跳转到复习页，加载缓存的分析结果。"""
+    article_key = make_article_key(link=article.get("link", ""))
+    cached = get_cached_analysis(article_key)
+    st.session_state.article_text = cached["article_text"] if cached else ""
+    st.session_state.current_article_title = article.get("title", "")
+    st.session_state.current_article_source_name = article.get("source", "")
+    st.session_state.current_article_link = article.get("link", "")
+    st.session_state.article_source = (
+        f"{st.session_state.current_article_source_name} · "
+        f"{st.session_state.current_article_title}"
+    ).strip(" ·")
+    st.session_state.analysis_results = cached["analysis_results"] if cached else {}
+    st.session_state.analysis_done = True
+    st.session_state.review_article_link = article.get("link", "")
+    st.session_state.page = "📖 文章复习"
     st.session_state.extraction_failed = False
     st.session_state.failed_article_link = ""
 
@@ -335,10 +361,11 @@ with st.sidebar:
     # 导航
     page = st.radio(
         "导航",
-        ["📰 每日推荐", "📖 阅读工具", "🧠 生词本", "📚 阅读记录"],
+        ["📰 每日推荐", "📖 阅读工具", "📖 文章复习", "🧠 生词本", "📚 阅读记录"],
         index=0 if st.session_state.page == "📰 每日推荐"
         else (1 if st.session_state.page == "📖 阅读工具"
-        else (2 if st.session_state.page == "🧠 生词本" else 3)),
+        else (2 if st.session_state.page == "📖 文章复习"
+        else (3 if st.session_state.page == "🧠 生词本" else 4))),
         label_visibility="collapsed",
     )
 
@@ -467,21 +494,45 @@ if st.session_state.page == "📰 每日推荐":
                     if col_btn.button("✅ 已读 / 重读", key=read_key, use_container_width=True):
                         _save_reading_time()
                         link = article["link"]
-                        with st.spinner("正在获取文章全文..."):
-                            full_text = extract_article_text(link)
-                        if full_text:
-                            # 规则模式计算难度（不调用 AI，不增加等待）
-                            try:
-                                diff = rule_difficulty(full_text)
-                                diff_label = f"{diff.get('level','')} {diff.get('stars','')}"
-                                update_article_difficulty(link, diff_label)
-                            except Exception:
-                                pass
-                            _load_article_into_state(article, full_text)
-                            st.success("✅ 已自动获取全文，正在跳转到阅读工具...")
+                        # 检查是否有缓存的分析结果
+                        article_key = make_article_key(link=link)
+                        cached = get_cached_analysis(article_key)
+                        if cached:
+                            # 有缓存 → 直接跳转复习页，无需重新提取正文
+                            # 更新阅读记录（保持最新 read_at）
+                            results = cached["analysis_results"]
+                            difficulty = results.get("difficulty", {})
+                            text = cached.get("article_text", "")
+                            save_reading_history(
+                                title=article.get("title", ""),
+                                source=article.get("source", ""),
+                                link=link,
+                                article_text=text[:5000],
+                                word_count=len(text.split()) if text else 0,
+                                difficulty=difficulty.get("level", "") if isinstance(difficulty, dict) else "",
+                                difficulty_score=difficulty.get("score", 0) if isinstance(difficulty, dict) else 0,
+                                difficulty_stars=difficulty.get("stars", "") if isinstance(difficulty, dict) else "",
+                            )
+                            _load_article_for_review(article)
+                            st.success("✅ 已有分析记录，直接进入复习模式")
                             st.rerun()
                         else:
-                            _set_article_extraction_failed(article)
+                            # 无缓存 → 提取正文，跳转翻译工具
+                            with st.spinner("正在获取文章全文..."):
+                                full_text = extract_article_text(link)
+                            if full_text:
+                                try:
+                                    diff = rule_difficulty(full_text)
+                                    diff_label = f"{diff.get('level','')} {diff.get('stars','')}"
+                                    update_article_difficulty(link, diff_label)
+                                except Exception:
+                                    pass
+                                _load_article_into_state(article, full_text)
+                                st.success("✅ 已自动获取全文，正在跳转到阅读工具...")
+                                st.rerun()
+                            else:
+                                _set_article_extraction_failed(article)
+                                st.rerun()
                             st.rerun()
                 else:
                     if col_btn.button("📖 开始阅读", key=read_key, use_container_width=True):
@@ -586,59 +637,85 @@ elif st.session_state.page == "📖 阅读工具":
             st.session_state.analysis_done = True
             st.session_state.analysis_results = {}  # 清空旧结果
 
-    # ── 并发执行分析 ──
+    # ── 并发执行分析（优先使用缓存）──
     if (
         st.session_state.analysis_done
         and article_text.strip()
         and not st.session_state.analysis_results
     ):
-        # 检查 API Key
-        try:
-            get_api_key()
-        except RuntimeError as e:
-            st.error(f"❌ 未找到 DEEPSEEK_API_KEY，请在 D:\\smartread\\.env 文件中配置后重试。")
-            st.stop()
+        import json
 
-        with st.spinner("🤖 三个 AI Agent 正在并发分析中（翻译 + 词汇 + 语法）..."):
-            results = {}
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(translate_article, article_text): "translation",
-                    executor.submit(extract_vocabulary, article_text): "vocabulary",
-                    executor.submit(analyze_grammar, article_text): "grammar",
-                    executor.submit(analyze_difficulty, article_text): "difficulty",
-                }
-                for future in as_completed(futures):
-                    key = futures[future]
-                    try:
-                        results[key] = future.result()
-                    except Exception as e:
-                        results[key] = {"_error": str(e)}
+        # 生成缓存键
+        article_key = make_article_key(
+            link=st.session_state.current_article_link or "",
+            text=article_text,
+        )
+
+        # 尝试从缓存加载
+        cached = get_cached_analysis(article_key)
+
+        if cached and cached.get("article_text") == article_text:
+            # 缓存命中 → 直接使用，跳过 API 调用
+            results = cached["analysis_results"]
             st.session_state.analysis_results = results
+            st.toast("📦 使用缓存的分析结果（免 API 调用）", icon="⚡")
+        else:
+            # 缓存未命中 → 调用 API 分析
+            try:
+                get_api_key()
+            except RuntimeError as e:
+                st.error(f"❌ 未找到 DEEPSEEK_API_KEY，请在 D:\\smartread\\.env 文件中配置后重试。")
+                st.stop()
 
-            # ── 保存阅读历史 ──
-            difficulty = results.get("difficulty", {})
-            word_count_val = len(article_text.split()) if article_text else 0
-            history_id = save_reading_history(
-                title=st.session_state.current_article_title or "手动输入",
-                source=st.session_state.current_article_source_name or "手动输入",
-                link=st.session_state.current_article_link or "",
-                article_text=article_text[:5000],
-                word_count=word_count_val,
-                difficulty=difficulty.get("level", "") if isinstance(difficulty, dict) else "",
-                difficulty_score=difficulty.get("score", 0) if isinstance(difficulty, dict) else 0,
-                difficulty_stars=difficulty.get("stars", "") if isinstance(difficulty, dict) else "",
-            )
-            st.session_state.reading_history_id = history_id
-            st.session_state.read_start_time = time.time()
-            # ── 保存阅读状态（恢复用）──
-            import json
-            save_reading_state(
-                article_text=article_text,
-                article_source=st.session_state.article_source,
-                analysis_results=json.dumps(results, ensure_ascii=False),
-            )
-            st.rerun()
+            with st.spinner("🤖 三个 AI Agent 正在并发分析中（翻译 + 词汇 + 语法）..."):
+                results = {}
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {
+                        executor.submit(translate_article, article_text): "translation",
+                        executor.submit(extract_vocabulary, article_text): "vocabulary",
+                        executor.submit(analyze_grammar, article_text): "grammar",
+                        executor.submit(analyze_difficulty, article_text): "difficulty",
+                    }
+                    for future in as_completed(futures):
+                        key = futures[future]
+                        try:
+                            results[key] = future.result()
+                        except Exception as e:
+                            results[key] = {"_error": str(e)}
+                st.session_state.analysis_results = results
+
+                # 保存分析结果到缓存
+                try:
+                    save_analysis_cache(
+                        article_key,
+                        article_text,
+                        json.dumps(results, ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
+
+        # ── 保存阅读历史（无论缓存命中与否都执行）──
+        difficulty = results.get("difficulty", {})
+        word_count_val = len(article_text.split()) if article_text else 0
+        history_id = save_reading_history(
+            title=st.session_state.current_article_title or "手动输入",
+            source=st.session_state.current_article_source_name or "手动输入",
+            link=st.session_state.current_article_link or "",
+            article_text=article_text[:5000],
+            word_count=word_count_val,
+            difficulty=difficulty.get("level", "") if isinstance(difficulty, dict) else "",
+            difficulty_score=difficulty.get("score", 0) if isinstance(difficulty, dict) else 0,
+            difficulty_stars=difficulty.get("stars", "") if isinstance(difficulty, dict) else "",
+        )
+        st.session_state.reading_history_id = history_id
+        st.session_state.read_start_time = time.time()
+        # ── 保存阅读状态（恢复用）──
+        save_reading_state(
+            article_text=article_text,
+            article_source=st.session_state.article_source,
+            analysis_results=json.dumps(results, ensure_ascii=False),
+        )
+        st.rerun()
 
     # ── 显示分析结果 ──
     if st.session_state.analysis_done and st.session_state.analysis_results:
@@ -649,6 +726,12 @@ elif st.session_state.page == "📖 阅读工具":
         # ── Tab 1：翻译 ──
         with tab1:
             translation = st.session_state.analysis_results.get("translation", {})
+
+            # 显示部分分段失败的警告（不影响整体结果）
+            if isinstance(translation, dict) and "_warnings" in translation:
+                for w in translation["_warnings"]:
+                    st.warning(w)
+
             if isinstance(translation, dict) and "_error" in translation:
                 st.error(f"翻译失败：{translation['_error']}")
             elif translation and "paragraphs" in translation:
@@ -730,7 +813,108 @@ elif st.session_state.page == "📖 阅读工具":
 
 
 # ═══════════════════════════════════════════════════════════
-# 页面 3：🧠 生词本
+# 页面 3：📖 文章复习
+# ═══════════════════════════════════════════════════════════
+elif st.session_state.page == "📖 文章复习":
+    st.title("📖 文章复习")
+
+    # 检查是否从每日推荐跳转过来，自动打开指定文章
+    highlight_link = st.session_state.get("review_article_link", "")
+
+    articles = get_reviewable_articles()
+
+    if not articles:
+        st.info("暂无已分析的文章可供复习。去「每日推荐」阅读并完成智能分析后，即可在此复习。")
+    else:
+        st.caption(f"共 {len(articles)} 篇已分析文章，点击展开即可复习翻译、词汇和语法")
+
+        for i, art in enumerate(articles):
+            # 文章标题行
+            diff_str = f" {art['difficulty']}" if art["difficulty"] else ""
+            fav_str = " ⭐" if art["favorite"] else ""
+            source_str = art["source"] or "未知来源"
+            read_date = art["read_at"][:10] if art["read_at"] else ""
+            title = art["title"] or "无标题"
+
+            expander_label = f"{source_str} · {title}{diff_str}{fav_str}  ({read_date})"
+
+            # 从每日推荐跳转过来的文章自动展开
+            is_target = highlight_link and art["link"] == highlight_link
+            expanded = is_target or (len(articles) <= 3)
+
+            with st.expander(expander_label, expanded=expanded):
+                results = art["analysis_results"]
+
+                # 文章元信息
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    article_source_url = art.get("link", "")
+                    if article_source_url:
+                        st.markdown(f"📎 [原文链接]({article_source_url})")
+                with col_b:
+                    st.caption(f"约 {art.get('word_count', 0):,} 词")
+
+                tab1, tab2, tab3 = st.tabs(["📖 中英对照", "📝 核心词汇", "🧠 长难句分析"])
+
+                with tab1:
+                    translation = results.get("translation", {})
+                    # 显示部分分段失败的警告
+                    if isinstance(translation, dict) and "_warnings" in translation:
+                        for w in translation["_warnings"]:
+                            st.warning(w)
+                    if isinstance(translation, dict) and "_error" in translation:
+                        st.error(f"翻译失败：{translation['_error']}")
+                    elif translation and "paragraphs" in translation:
+                        for para in translation["paragraphs"]:
+                            if para.get("original"):
+                                st.markdown(
+                                    f'<div class="original-text">{html.escape(para["original"])}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            if para.get("translated"):
+                                st.markdown(
+                                    f'<div class="translated-text">{html.escape(para["translated"])}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                    elif translation and "raw_translation" in translation:
+                        st.text_area("翻译（原始格式）", translation["raw_translation"], height=200, key=f"raw_{art['id']}")
+                    else:
+                        st.caption("无翻译数据")
+
+                with tab2:
+                    vocab = results.get("vocabulary", [])
+                    if isinstance(vocab, list) and vocab:
+                        for v in vocab:
+                            word = v.get("word", "")
+                            phonetic = v.get("phonetic", "")
+                            meaning = v.get("meaning", "")
+                            sentence = v.get("sentence", "")
+                            st.markdown(f"**{html.escape(word)}**  {html.escape(phonetic)}  —  *{html.escape(meaning)}*")
+                            if sentence:
+                                st.caption(html.escape(sentence))
+                    elif isinstance(vocab, dict) and "_error" in vocab:
+                        st.error(f"词汇提取失败：{vocab['_error']}")
+                    else:
+                        st.caption("无词汇数据")
+
+                with tab3:
+                    grammar = results.get("grammar", [])
+                    if isinstance(grammar, list) and grammar:
+                        for g in grammar:
+                            st.markdown(f"**{html.escape(g.get('sentence', ''))}**")
+                            st.caption(html.escape(g.get("analysis", "")))
+                    elif isinstance(grammar, dict) and "_error" in grammar:
+                        st.error(f"语法分析失败：{grammar['_error']}")
+                    else:
+                        st.caption("无语法分析数据")
+
+    # 清除跳转标记（只自动展开一次）
+    if highlight_link:
+        st.session_state.review_article_link = ""
+
+
+# ═══════════════════════════════════════════════════════════
+# 页面 4：🧠 生词本
 # ═══════════════════════════════════════════════════════════
 elif st.session_state.page == "🧠 生词本":
     st.title("🧠 我的生词本")
@@ -796,7 +980,7 @@ elif st.session_state.page == "🧠 生词本":
 
 
 # ═══════════════════════════════════════════════════════════
-# 页面 4：📚 阅读记录
+# 页面 5：📚 阅读记录
 # ═══════════════════════════════════════════════════════════
 elif st.session_state.page == "📚 阅读记录":
     st.title("📚 阅读记录")
@@ -865,19 +1049,29 @@ elif st.session_state.page == "📚 阅读记录":
                     if h.get("article_text"):
                         if st.button("📖 重新阅读", key=f"reread_{h['id']}", help="在阅读工具中打开"):
                             _save_reading_time()
-                            st.session_state.article_text = h.get("article_text", "")
-                            st.session_state.current_article_title = h.get("title", "")
-                            st.session_state.current_article_source_name = h.get("source", "")
-                            st.session_state.current_article_link = h.get("link", "")
-                            st.session_state.article_source = (
-                                f"{h.get('source', '')} · {h.get('title', '')}"
-                            ).strip(" ·")
-                            st.session_state.analysis_results = {}
-                            st.session_state.analysis_done = False
-                            st.session_state.extraction_failed = False
-                            st.session_state.failed_article_link = ""
-                            st.session_state.page = "📖 阅读工具"
-                            st.rerun()
+                            link = h.get("link", "")
+                            article_key = make_article_key(link=link)
+                            cached = get_cached_analysis(article_key)
+                            if cached:
+                                # 有缓存 → 跳到复习页
+                                article_ref = {"title": h.get("title", ""), "source": h.get("source", ""), "link": link}
+                                _load_article_for_review(article_ref)
+                                st.rerun()
+                            else:
+                                # 无缓存 → 跳到阅读工具
+                                st.session_state.article_text = h.get("article_text", "")
+                                st.session_state.current_article_title = h.get("title", "")
+                                st.session_state.current_article_source_name = h.get("source", "")
+                                st.session_state.current_article_link = link
+                                st.session_state.article_source = (
+                                    f"{h.get('source', '')} · {h.get('title', '')}"
+                                ).strip(" ·")
+                                st.session_state.analysis_results = {}
+                                st.session_state.analysis_done = False
+                                st.session_state.extraction_failed = False
+                                st.session_state.failed_article_link = ""
+                                st.session_state.page = "📖 阅读工具"
+                                st.rerun()
                     if st.button("⭐" if fav else "☆", key=f"fav_{h['id']}", help="收藏/取消"):
                         toggle_favorite(h["id"])
                         st.rerun()

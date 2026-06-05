@@ -11,7 +11,7 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_TIMEOUT = 60
 DEFAULT_TEMPERATURE = 0.3
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 8192
 
 
 @dataclass
