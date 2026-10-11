@@ -48,9 +48,18 @@ def _get_conn() -> sqlite3.Connection:
             article_text TEXT DEFAULT '',
             article_source TEXT DEFAULT '',
             analysis_results TEXT DEFAULT '',
+            link TEXT DEFAULT '',
+            title TEXT DEFAULT '',
+            source_name TEXT DEFAULT '',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 旧表迁移：新增 link/title/source_name 字段（供重启恢复后正确命中分析缓存）
+    for _col in ("link", "title", "source_name"):
+        try:
+            conn.execute(f"ALTER TABLE reading_state ADD COLUMN {_col} TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # 字段已存在则跳过
     conn.execute("""
         CREATE TABLE IF NOT EXISTS analysis_cache (
             article_key TEXT PRIMARY KEY,
@@ -89,6 +98,26 @@ def save_reading_history(
             favorite = existing["favorite"]
         # 删除同 link 的旧记录，确保一篇文章只有一条阅读记录
         conn.execute("DELETE FROM reading_history WHERE link = ? AND link != ''", (link,))
+    elif article_text:
+        # 无链接的手动粘贴文章按正文去重：重复分析视为重读，更新原记录而非新增
+        dup = conn.execute(
+            "SELECT id FROM reading_history WHERE link = '' AND article_text = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (article_text,),
+        ).fetchone()
+        if dup:
+            conn.execute(
+                """UPDATE reading_history
+                   SET title = ?, source = ?, word_count = ?, difficulty = ?,
+                       difficulty_score = ?, difficulty_stars = ?,
+                       read_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (title, source, word_count, difficulty, difficulty_score,
+                 difficulty_stars, dup["id"]),
+            )
+            conn.commit()
+            conn.close()
+            return dup["id"]
     cursor = conn.execute(
         """INSERT INTO reading_history
            (title, source, link, article_text, word_count,
@@ -106,7 +135,7 @@ def save_reading_history(
 def get_reading_history(source: str = None, favorite_only: bool = False) -> list[dict]:
     """获取阅读历史，支持按来源和收藏筛选"""
     conn = _get_conn()
-    query = "SELECT * FROM reading_history WHERE 1=1"
+    query = "SELECT *, date(read_at, 'localtime') as read_date FROM reading_history WHERE 1=1"
     params: list = []
     if source and source != "全部":
         query += " AND source = ?"
@@ -150,14 +179,15 @@ def get_reading_stats() -> dict:
     conn = _get_conn()
     total = conn.execute("SELECT COUNT(*) as cnt FROM reading_history").fetchone()
     today = conn.execute(
-        "SELECT COUNT(*) as cnt FROM reading_history WHERE date(read_at) = date('now', 'localtime')"
+        "SELECT COUNT(*) as cnt FROM reading_history "
+        "WHERE date(read_at, 'localtime') = date('now', 'localtime')"
     ).fetchone()
     total_words = conn.execute(
         "SELECT COALESCE(SUM(word_count), 0) as cnt FROM reading_history"
     ).fetchone()
     # ── 真连续打卡天数 ──
     dates = conn.execute(
-        "SELECT DISTINCT date(read_at) as d FROM reading_history ORDER BY d DESC"
+        "SELECT DISTINCT date(read_at, 'localtime') as d FROM reading_history ORDER BY d DESC"
     ).fetchall()
     conn.close()
 
@@ -209,15 +239,19 @@ def save_reading_state(
     article_text: str = "",
     article_source: str = "",
     analysis_results: str = "",
+    link: str = "",
+    title: str = "",
+    source_name: str = "",
 ) -> None:
-    """保存当前阅读状态到 SQLite"""
+    """保存当前阅读状态到 SQLite（含文章链接与元数据，供重启恢复后命中分析缓存）"""
     conn = _get_conn()
     conn.execute(
         """UPDATE reading_state
            SET article_text = ?, article_source = ?,
-               analysis_results = ?, updated_at = CURRENT_TIMESTAMP
+               analysis_results = ?, link = ?, title = ?, source_name = ?,
+               updated_at = CURRENT_TIMESTAMP
            WHERE id = 1""",
-        (article_text, article_source, analysis_results),
+        (article_text, article_source, analysis_results, link, title, source_name),
     )
     conn.commit()
     conn.close()
@@ -233,6 +267,9 @@ def load_reading_state() -> dict:
             "article_text": row["article_text"] or "",
             "article_source": row["article_source"] or "",
             "analysis_results": row["analysis_results"] or "",
+            "link": row["link"] or "",
+            "title": row["title"] or "",
+            "source_name": row["source_name"] or "",
         }
     return {}
 
@@ -282,6 +319,33 @@ def save_analysis_cache(article_key: str, article_text: str, analysis_results: s
     conn.close()
 
 
+def prune_analysis_cache(keep_days: int = 90, max_rows: int = 200) -> int:
+    """
+    清理分析缓存，防止 analysis_cache 无限膨胀（每条存全文 + 结果 JSON）
+    - 删除超过 keep_days 天的记录
+    - 仅保留最新 max_rows 条
+    返回删除的记录数
+    """
+    keep_days = max(int(keep_days), 1)
+    max_rows = max(int(max_rows), 1)
+    conn = _get_conn()
+    c1 = conn.execute(
+        f"DELETE FROM analysis_cache "
+        f"WHERE created_at < datetime('now', '-{keep_days} days')"
+    )
+    c2 = conn.execute(
+        """DELETE FROM analysis_cache WHERE article_key NOT IN (
+               SELECT article_key FROM analysis_cache
+               ORDER BY created_at DESC LIMIT ?
+           )""",
+        (max_rows,),
+    )
+    deleted = c1.rowcount + c2.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def get_reviewable_articles() -> list[dict]:
     """
     获取所有有缓存分析结果的已读文章，用于「文章复习」页面
@@ -292,7 +356,8 @@ def get_reviewable_articles() -> list[dict]:
     conn = _get_conn()
 
     rows = conn.execute(
-        "SELECT * FROM reading_history WHERE link != '' ORDER BY read_at DESC LIMIT 200"
+        "SELECT *, date(read_at, 'localtime') as read_date "
+        "FROM reading_history WHERE link != '' ORDER BY read_at DESC LIMIT 200"
     ).fetchall()
 
     result = []
@@ -315,6 +380,7 @@ def get_reviewable_articles() -> list[dict]:
                 "difficulty": row["difficulty"] or "",
                 "difficulty_stars": row["difficulty_stars"] or "",
                 "read_at": row["read_at"] or "",
+                "read_date": row["read_date"] or "",
                 "favorite": row["favorite"],
                 "word_count": row["word_count"] or 0,
                 "analysis_results": analysis,

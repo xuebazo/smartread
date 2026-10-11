@@ -4,7 +4,7 @@ r"""
 """
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = Path(__file__).parent / "cache.db"
 
@@ -92,7 +92,8 @@ def prune_old_articles(days: int = 30) -> int:
     清理指定天数前的旧记录
     返回删除的记录数
     """
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    # fetched_at 以 UTC 存储（CURRENT_TIMESTAMP），比较基准需一致
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_connection()
     cursor = conn.execute(
         "DELETE FROM articles WHERE fetched_at < ?", (cutoff,)

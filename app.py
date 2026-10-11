@@ -9,6 +9,8 @@ import html
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import logging
+
 import streamlit as st
 import requests
 import time
@@ -56,8 +58,11 @@ from database.history_repository import (
     make_article_key,
     get_cached_analysis,
     save_analysis_cache,
+    prune_analysis_cache,
     get_reviewable_articles,
 )
+
+logger = logging.getLogger(__name__)
 
 # ─── 页面配置 ────────────────────────────────────────────
 st.set_page_config(
@@ -133,8 +138,12 @@ def get_source_class(source_name: str) -> str:
     return mapping.get(source_name, "lutoushe")
 
 
-# ─── 数据库自动备份 ────────────────────────────
+# ─── 数据库自动备份与分析缓存清理 ───────────────
 run_backup()
+try:
+    prune_analysis_cache()
+except Exception as e:
+    logger.warning(f"分析缓存清理失败（不影响应用运行）: {e}")
 
 # ─── 状态初始化 ──────────────────────────────────────────
 if "page" not in st.session_state:
@@ -180,15 +189,19 @@ if "current_article_link" not in st.session_state:
 if not st.session_state.article_text and not st.session_state.analysis_results:
     saved = load_reading_state()
     if saved.get("article_text"):
+        import json
         st.session_state.article_text = saved["article_text"]
         st.session_state.article_source = saved.get("article_source", "")
-        st.session_state.analysis_done = False
-        st.session_state.analysis_results = {}
-        import json
+        st.session_state.current_article_link = saved.get("link", "")
+        st.session_state.current_article_title = saved.get("title", "")
+        st.session_state.current_article_source_name = saved.get("source_name", "")
+        # 分析结果随状态持久化：恢复后直接展示，不重复调用 API
         try:
-            st.session_state.saved_results = json.loads(saved.get("analysis_results", "{}"))
+            restored_results = json.loads(saved.get("analysis_results", "{}"))
         except (json.JSONDecodeError, TypeError):
-            st.session_state.saved_results = {}
+            restored_results = {}
+        st.session_state.analysis_results = restored_results
+        st.session_state.analysis_done = bool(restored_results)
 
 
 # ─── API 状态检查 ────────────────────────────────────────
@@ -240,6 +253,7 @@ def _load_article_into_state(article: dict, full_text: str) -> None:
     ).strip(" ·")
     st.session_state.page = "📖 阅读工具"
     st.session_state.analysis_done = False
+    st.session_state.analysis_results = {}
     st.session_state.extraction_failed = False
     st.session_state.failed_article_link = ""
 
@@ -589,8 +603,8 @@ elif st.session_state.page == "📖 阅读工具":
                 clear_reading_state()
                 st.rerun()
 
-    # ── 难度评级 ──（有分析结果且无错误时才显示）
-    if st.session_state.analysis_results and has_article:
+    # ── 难度评级 ──（分析完成且有结果时才显示，避免切换文章后残留旧评级）
+    if st.session_state.analysis_done and st.session_state.analysis_results and has_article:
         difficulty = st.session_state.analysis_results.get("difficulty", {})
         if isinstance(difficulty, dict) and "level" in difficulty:
             level = difficulty.get("level", "CET4")
@@ -709,11 +723,14 @@ elif st.session_state.page == "📖 阅读工具":
         )
         st.session_state.reading_history_id = history_id
         st.session_state.read_start_time = time.time()
-        # ── 保存阅读状态（恢复用）──
+        # ── 保存阅读状态（恢复用，含链接与元数据）──
         save_reading_state(
             article_text=article_text,
             article_source=st.session_state.article_source,
             analysis_results=json.dumps(results, ensure_ascii=False),
+            link=st.session_state.current_article_link or "",
+            title=st.session_state.current_article_title or "",
+            source_name=st.session_state.current_article_source_name or "",
         )
         st.rerun()
 
@@ -833,7 +850,7 @@ elif st.session_state.page == "📖 文章复习":
             diff_str = f" {art['difficulty']}" if art["difficulty"] else ""
             fav_str = " ⭐" if art["favorite"] else ""
             source_str = art["source"] or "未知来源"
-            read_date = art["read_at"][:10] if art["read_at"] else ""
+            read_date = art.get("read_date", "") or (art["read_at"][:10] if art["read_at"] else "")
             title = art["title"] or "无标题"
 
             expander_label = f"{source_str} · {title}{diff_str}{fav_str}  ({read_date})"
@@ -947,7 +964,7 @@ elif st.session_state.page == "🧠 生词本":
                     st.caption(f"📝 例句：{w.get('example', '')}")
                     if w.get("source_article"):
                         st.caption(f"📌 来源：{w['source_article']}")
-                    st.caption(f"📅 收藏时间：{w.get('created_at', '')[:10]}")
+                    st.caption(f"📅 收藏时间：{w.get('created_date', '') or w.get('created_at', '')[:10]}")
                     st.caption(f"🔁 复习次数：{w.get('review_count', 0)}")
 
                     col_k1, col_k2, col_k3 = st.columns([1, 1, 2])
@@ -1039,7 +1056,7 @@ elif st.session_state.page == "📚 阅读记录":
                     minutes = h.get('reading_minutes', 0) or 0
                     time_str = f"⏱️ {minutes}分钟" if minutes > 0 else "⏱️ —"
                     st.caption(
-                        f"📅 {h.get('read_at', '')[:10]}"
+                        f"📅 {h.get('read_date', '') or h.get('read_at', '')[:10]}"
                         f"  ·  {time_str}"
                         f"  ·  📝 {h.get('word_count', 0)}词"
                         f"  ·  难度 {h.get('difficulty', '?')} {h.get('difficulty_stars', '')}"

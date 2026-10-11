@@ -95,12 +95,14 @@ def get_all_words(search: str = None) -> list[dict]:
     conn = _get_conn()
     if search:
         rows = conn.execute(
-            "SELECT * FROM saved_words WHERE word LIKE ? OR meaning LIKE ? ORDER BY created_at DESC",
+            "SELECT *, date(created_at, 'localtime') as created_date "
+            "FROM saved_words WHERE word LIKE ? OR meaning LIKE ? ORDER BY created_at DESC",
             (f"%{search}%", f"%{search}%"),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM saved_words ORDER BY created_at DESC"
+            "SELECT *, date(created_at, 'localtime') as created_date "
+            "FROM saved_words ORDER BY created_at DESC"
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
