@@ -91,8 +91,6 @@ AI + 规则双模式评级，将文章分类为 CET4 / CET6 / 考研 / IELTS 四
 
 ---
 
----
-
 ## 🚀 Quick Start | 快速开始
 
 ### 💻 Local | 本地运行
