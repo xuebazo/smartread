@@ -1,6 +1,8 @@
 [server]
 # Tolerate slow/unstable network (important for mainland China users)
 maxUploadSize = 200
+# Bind to localhost only, avoid exposing the app to the LAN
+address = "127.0.0.1"
 
 [browser]
 gatherUsageStats = false
