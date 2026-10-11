@@ -67,12 +67,29 @@ AI + 规则双模式评级，将文章分类为 CET4 / CET6 / 考研 / IELTS 四
 ### 💾 State Recovery | 状态自动恢复
 > Analysis results persist across page refreshes and app restarts. No API re-calls needed.
 
-刷新页面或重启后自动恢复上次阅读状态和分析结果，不重复消耗 API 额度。
+刷新页面或重启后自动恢复上次阅读状态、分析结果**以及文章链接/标题/来源**，不重复消耗 API 额度；切换文章时会清空上一篇的难度评级，避免残留。
 
 ### 🛡️ Auto Backup | 数据库自动备份
 > Daily backup of the SQLite database on app startup, with 7-day rotation. Data safety without manual intervention.
 
 每次启动自动备份数据库，保留 7 天备份记录，数据安全无忧。
+
+### 🧹 Cache Hygiene | 分析缓存自动清理
+> Every analysis stores the full article text plus its result JSON, so the cache grows without bound. `prune_analysis_cache(keep_days=90, max_rows=200)` keeps it in check automatically.
+
+每篇分析都会把**全文 + 结果 JSON** 存下来，缓存会持续膨胀；新增 `prune_analysis_cache(keep_days=90, max_rows=200)` 自动瘦身：保留 90 天内、最多 200 条。
+
+### 🔁 Duplicate Handling | 无链接文章去重
+> Manually pasted articles have no URL, so they are de-duplicated by body text — re-analyzing the same text counts as a re-read and updates the existing record instead of adding a duplicate row.
+
+手动粘贴的文章没有链接，改为**按正文去重**：重复分析同一段正文视为重读，更新原记录而不是新增一条，阅读统计不会重复计数。
+
+### 🕒 Time Consistency | 时间基准统一
+> Reading / vocabulary / stats dates now all render in **local time**, while cache pruning uses UTC to line up with SQLite `CURRENT_TIMESTAMP` — fixes the classic "favorited yesterday" and "today's count is off" bugs.
+
+阅读记录、生词本、统计日期统一按**本地日期**显示（不再出现「昨天收藏」这类 UTC 错位）；缓存清理改用 UTC 基准，与 SQLite `CURRENT_TIMESTAMP` 对齐，清理范围不再偏 8 小时。
+
+---
 
 ---
 
@@ -86,7 +103,7 @@ AI + 规则双模式评级，将文章分类为 CET4 / CET6 / 考研 / IELTS 四
 
 ```bash
 # 1. Clone & enter project | 克隆并进入项目
-git clone https://github.com/YOUR_USERNAME/smartread.git
+git clone https://github.com/xuebazo/smartread.git
 cd smartread
 
 # 2. Create virtual environment | 创建虚拟环境 (recommended)
@@ -152,6 +169,7 @@ DEEPSEEK_API_KEY = "sk-your-key-here"
 > - Apps sleep after ~5 days of inactivity → cold start takes 10-30 seconds | 5 天无人访问后休眠，冷启动约 10-30 秒
 > - 1 GB RAM limit (plenty for this app) | 1 GB 内存限制（本应用绰绰有余）
 > - Domain is accessible from China without VPN | `streamlit.app` 域名国内可直接访问，无需翻墙
+> - If a cloud deploy ever fails to load, check `.streamlit/config.toml` (`address`) — that is a local hardening setting | 若云端部署打不开，先检查 `.streamlit/config.toml` 的 `address`，那是本地加固用的设置
 
 ---
 
@@ -249,7 +267,7 @@ All data stored in `cache.db` (SQLite), auto-created on first run.
 | `articles` | 文章缓存 | Cached RSS articles | 缓存外刊文章 | `title`, `link`(UNIQUE), `source` |
 | `saved_words` | 生词本 | User-saved vocabulary | 用户收藏的单词 | `word`, `phonetic`, `meaning`, `known_level`(0-2) |
 | `reading_history` | 阅读记录 | Reading logs + stats | 阅读历史 + 统计 | `word_count`, `difficulty`, `reading_minutes`, `favorite` |
-| `reading_state` | 状态恢复 | Auto-saved analysis state | 自动恢复分析状态 | Single-row, stores `analysis_results` JSON |
+| `reading_state` | 状态恢复 | Auto-saved analysis state | 自动恢复分析状态 | Single-row; `analysis_results` JSON + `link` / `title` / `source_name` |
 
 ---
 
@@ -292,6 +310,7 @@ All data stored in `cache.db` (SQLite), auto-created on first run.
 | **API Key** | API 密钥 | Never hardcoded, gitignored via `.env`, managed via Streamlit Secrets on cloud | 不存代码，`.env` 排除，云端用 Secrets |
 | **Reading Data** | 阅读数据 | All data in local SQLite. Backups auto-rotated after 7 days | 本地 SQLite，备份 7 天自动轮转 |
 | **Network** | 网络请求 | Only calls to DeepSeek API + RSS sources. No third-party tracking | 仅调用 DeepSeek API 和 RSS 源 |
+| **Bind Address** | 监听地址 | Local runs bind to `127.0.0.1` only — never exposed to your LAN | 本地仅监听 `127.0.0.1`，不暴露到局域网 |
 | **No Telemetry** | 零追踪 | Zero analytics, zero tracking, zero data collection | 零分析、零追踪、零数据收集 |
 
 **Security Checklist before deployment | 部署前安全检查：**
